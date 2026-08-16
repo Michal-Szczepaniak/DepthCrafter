@@ -103,6 +103,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         return_dict: bool = True,
         overlap: int = 25,
         track_time: bool = False,
+        carry_latents: Optional[torch.Tensor] = None,
     ):
         """
         :param video: in shape [t, h, w, c] if np.ndarray or [t, c, h, w] if torch.Tensor, in range [0, 1]
@@ -121,6 +122,16 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :param callback_on_step_end:
         :param callback_on_step_end_tensor_inputs:
         :param return_dict:
+        :param carry_latents: final `overlap` frames of `latents_all` returned by a
+            previous call (via `self.last_tail_latents`), fed back in as the seed for
+            this call's own `latents_all`. This makes the caller's own chunk-to-chunk
+            boundary behave exactly like an ordinary internal window transition - the
+            existing crossfade blend below treats it identically to any other window's
+            tail, so multi-chunk streaming gets the same continuity as an internal
+            window seam instead of a post-hoc scale/shift patch. `video`'s first
+            `overlap` frames must be the same source frames `carry_latents` was
+            computed from (re-fed as leading context), matching how internal windows
+            already re-see their own overlap region.
         :return:
         """
         # 0. Default height and width to unet
@@ -128,6 +139,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         width = width or self.unet.config.sample_size * self.vae_scale_factor
         num_frames = video.shape[0]
         decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 8
+        requested_overlap = overlap
         if num_frames <= window_size:
             window_size = num_frames
             overlap = 0
@@ -229,7 +241,11 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             generator,
             latents,
         )  # [1, t, c, h, w]
-        latents_all = None
+        latents_all = (
+            carry_latents.to(device=device, dtype=latents_init.dtype)
+            if carry_latents is not None
+            else None
+        )
 
         idx_start = 0
         if overlap > 0:
@@ -334,6 +350,18 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
 
             idx_start += stride
 
+        # Exposed for the caller to feed into a following call's `carry_latents`,
+        # so a chunk-to-chunk boundary crossfades in latent space exactly like an
+        # internal window boundary does, instead of needing a post-hoc scale/shift
+        # fit on the decoded output. None when this call's own windowing degenerated
+        # to a single window (num_frames <= window_size), since there's no overlap
+        # tail to hand off in that case.
+        self.last_tail_latents = (
+            latents_all[:, -requested_overlap:].detach().clone()
+            if requested_overlap > 0
+            else None
+        )
+
         if track_time:
             denoise_event.record()
             torch.cuda.synchronize()
@@ -344,7 +372,10 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
-            frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
+            # latents_all may be longer than `num_frames` (this call's own new
+            # frames) when it was seeded via `carry_latents` - use its actual
+            # length rather than the input video's frame count.
+            frames = self.decode_latents(latents_all, latents_all.shape[1], decode_chunk_size)
 
             if track_time:
                 decode_event.record()

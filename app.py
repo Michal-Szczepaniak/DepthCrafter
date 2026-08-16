@@ -56,7 +56,6 @@ def infer_depth(
     save_npz: bool = False,
 ):
     set_seed(seed)
-    pipe.enable_xformers_memory_efficient_attention()
 
     frames, target_fps = read_video_frames(video, process_length, target_fps, max_res)
 

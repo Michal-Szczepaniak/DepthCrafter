@@ -43,11 +43,6 @@ class DepthCrafterDemo:
         else:
             self.pipe.to("cuda")
         # enable attention slicing and xformers memory efficient attention
-        try:
-            self.pipe.enable_xformers_memory_efficient_attention()
-        except Exception as e:
-            print(e)
-            print("Xformers is not enabled")
         self.pipe.enable_attention_slicing()
 
     def infer(
