@@ -254,6 +254,21 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         else:
             weights = None
 
+        # Separate from `weights` above (which drives window-to-window
+        # blending *inside* this call's own while-loop, and is None
+        # whenever this call's own windowing degenerated to a single
+        # window). This blends this call's output against a caller-
+        # provided `carry_latents` tail, sized by requested_overlap - needs
+        # to be its own thing because the degenerate case (num_frames <=
+        # window_size) zeros `overlap`/`weights` above even when
+        # carry_latents was provided and still needs blending against.
+        carry_weights = None
+        if carry_latents is not None:
+            carry_blend_len = min(requested_overlap, num_frames)
+            if carry_blend_len > 0:
+                carry_weights = torch.linspace(0, 1, carry_blend_len, device=device)
+                carry_weights = carry_weights.view(1, carry_blend_len, 1, 1, 1)
+
         torch.cuda.empty_cache()
 
         # inference strategy for long videos
@@ -274,12 +289,28 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     if latents_all is not None and i == 0:
-                        latents[:, :overlap] = (
-                            latents_all[:, -overlap:]
-                            + latents[:, :overlap]
-                            / self.scheduler.init_noise_sigma
-                            * self.scheduler.sigmas[i]
-                        )
+                        # Blend against the caller's carried-over tail
+                        # (carry_latents), sized by requested_overlap - NOT
+                        # `overlap`, which the num_frames <= window_size
+                        # degenerate case above may have zeroed for THIS
+                        # call's own (now-single) internal window. Using
+                        # `overlap` here for a zeroed-overlap call broke on
+                        # a `-0 == 0` slicing gotcha: latents_all[:, -0:] is
+                        # the FULL carried tail (not empty), while
+                        # latents[:, :0] is empty - a shape mismatch that
+                        # only ever showed up on a final chunk shorter than
+                        # window_size. Also clamp to this window's own
+                        # frame count in case it's shorter than
+                        # requested_overlap too (e.g. a very short final
+                        # chunk).
+                        blend_len = min(requested_overlap, latents.shape[1])
+                        if blend_len > 0:
+                            latents[:, :blend_len] = (
+                                latents_all[:, -blend_len:]
+                                + latents[:, :blend_len]
+                                / self.scheduler.init_noise_sigma
+                                * self.scheduler.sigmas[i]
+                            )
 
                     latent_model_input = latents  # [1, t, c, h, w]
                     latent_model_input = self.scheduler.scale_model_input(
@@ -338,7 +369,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
 
             if latents_all is None:
                 latents_all = latents.clone()
-            else:
+            elif overlap > 0:
                 assert weights is not None
                 # latents_all[:, -overlap:] = (
                 #     latents[:, :overlap] + latents_all[:, -overlap:]
@@ -347,6 +378,24 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     :, :overlap
                 ] * weights + latents_all[:, -overlap:] * (1 - weights)
                 latents_all = torch.cat([latents_all, latents[:, overlap:]], dim=1)
+            else:
+                # Degenerate single-window call (num_frames <= window_size)
+                # that still received carry_latents: no internal-window
+                # overlap to blend (overlap==0), but this window's start
+                # still needs reconciling against the carried tail - the
+                # i==0 step above already seeded the initial noise with it,
+                # this blends the final denoised output the same way the
+                # overlap>0 branch does (once at noise-seed time, once at
+                # the end), then replaces latents_all outright since this
+                # single window's output already covers the whole call -
+                # there's nothing else left to concatenate.
+                assert carry_weights is not None
+                blend_len = carry_weights.shape[1]
+                latents[:, :blend_len] = (
+                    latents[:, :blend_len] * carry_weights
+                    + latents_all[:, -blend_len:] * (1 - carry_weights)
+                )
+                latents_all = latents
 
             idx_start += stride
 
