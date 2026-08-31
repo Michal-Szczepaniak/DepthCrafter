@@ -29,13 +29,24 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :return: image_embeddings in shape of [b, 1024]
         """
 
-        video_224 = _resize_with_antialiasing(video.float(), (224, 224))
-        video_224 = (video_224 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-
         embeddings = []
-        for i in range(0, video_224.shape[0], chunk_size):
+        for i in range(0, video.shape[0], chunk_size):
+            # Resize batched per-chunk (was previously done once on the whole
+            # unbatched `video` tensor before this loop) - a real bug fixed
+            # this session: with a large enough CHUNK_SIZE upstream, that
+            # single unbatched antialiasing resize (a Gaussian-blur-based
+            # torch.nn.functional.pad under the hood) OOM'd on its own even
+            # though every other step in this pipeline is already chunked to
+            # `chunk_size`/decode_chunk_size. Purely a per-frame spatial
+            # resize with no cross-frame dependency, so chunking it here
+            # produces bit-identical output to the unbatched version - same
+            # already-established pattern as encode_vae_video() just below.
+            video_224_chunk = _resize_with_antialiasing(
+                video[i : i + chunk_size].float(), (224, 224)
+            )
+            video_224_chunk = (video_224_chunk + 1.0) / 2.0  # [-1, 1] -> [0, 1]
             tmp = self.feature_extractor(
-                images=video_224[i : i + chunk_size],
+                images=video_224_chunk,
                 do_normalize=True,
                 do_center_crop=False,
                 do_resize=False,
