@@ -478,9 +478,38 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 elapsed_time_ms = denoise_event.elapsed_time(decode_event)
                 print(f"Elapsed time for decoding video: {elapsed_time_ms} ms")
 
-            frames = self.video_processor.postprocess_video(
-                video=frames, output_type=output_type
-            )
+            # Same OOM bug class as encode_video/decode_latents above:
+            # video_processor.postprocess_video() (and the
+            # VaeImageProcessor.postprocess() it calls internally) has no
+            # batching of its own - it does an unbatched torch.stack() over
+            # every frame in `frames` at once. Fine at normal video-gen
+            # frame counts, OOMs at our CHUNK_SIZE. Batch it ourselves by
+            # decode_chunk_size here (frames is [batch=1, channels,
+            # num_frames, H, W] - slice along the frame dim, dim=2) and
+            # reassemble, matching postprocess_video's own per-output_type
+            # return shape (np/pt add a leading batch dim via stack; pil
+            # returns a plain list-of-lists, one inner list per batch item).
+            if output_type == "pil":
+                postprocessed = []
+                for i in range(0, frames.shape[2], decode_chunk_size):
+                    batch_output = self.video_processor.postprocess_video(
+                        video=frames[:, :, i : i + decode_chunk_size], output_type=output_type
+                    )
+                    postprocessed.extend(batch_output[0])
+                frames = [postprocessed]
+            else:
+                postprocessed = []
+                for i in range(0, frames.shape[2], decode_chunk_size):
+                    batch_output = self.video_processor.postprocess_video(
+                        video=frames[:, :, i : i + decode_chunk_size], output_type=output_type
+                    )
+                    postprocessed.append(batch_output)
+                if output_type == "np":
+                    frames = np.concatenate(postprocessed, axis=1)
+                elif output_type == "pt":
+                    frames = torch.cat(postprocessed, dim=1)
+                else:
+                    raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
         else:
             frames = latents_all
 
