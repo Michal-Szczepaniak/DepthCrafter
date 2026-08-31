@@ -1,3 +1,4 @@
+import inspect
 from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -10,7 +11,7 @@ from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion 
     retrieve_timesteps,
 )
 from diffusers.utils import logging
-from diffusers.utils.torch_utils import randn_tensor
+from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -76,6 +77,40 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             )
         video_latents = torch.cat(video_latents, dim=0)
         return video_latents
+
+    @torch.inference_mode()
+    def decode_latents(self, latents: torch.Tensor, num_frames: int, decode_chunk_size: int = 14):
+        """Override of StableVideoDiffusionPipeline.decode_latents - fixes a
+        real OOM at large CHUNK_SIZE, same bug class as encode_video()
+        above. Upstream already batches the actual VAE decode call by
+        decode_chunk_size (the for loop below, unchanged), but then
+        concatenates every batch into one whole-chunk tensor BEFORE casting
+        to float32 - upstream's own comment calls that cast "not
+        significant overhead", true only at the small decode_chunk_size-ish
+        frame counts video generation normally uses, not at our CHUNK_SIZE
+        (which can be 1000+ frames chained into one call). Fixed by casting
+        each batch to float32 individually, before concatenation, so the
+        cast's memory footprint is bounded by decode_chunk_size like every
+        other step here, not by the whole chunk.
+        """
+        latents = latents.flatten(0, 1)
+        latents = 1 / self.vae.config.scaling_factor * latents
+
+        forward_vae_fn = self.vae._orig_mod.forward if is_compiled_module(self.vae) else self.vae.forward
+        accepts_num_frames = "num_frames" in set(inspect.signature(forward_vae_fn).parameters.keys())
+
+        frames = []
+        for i in range(0, latents.shape[0], decode_chunk_size):
+            num_frames_in = latents[i : i + decode_chunk_size].shape[0]
+            decode_kwargs = {}
+            if accepts_num_frames:
+                decode_kwargs["num_frames"] = num_frames_in
+            frame = self.vae.decode(latents[i : i + decode_chunk_size], **decode_kwargs).sample
+            frames.append(frame.float())  # cast per-batch, not after concatenation
+        frames = torch.cat(frames, dim=0)
+
+        frames = frames.reshape(-1, num_frames, *frames.shape[1:]).permute(0, 2, 1, 3, 4)
+        return frames
 
     @staticmethod
     def check_inputs(video, height, width):
