@@ -84,14 +84,18 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         real OOM at large CHUNK_SIZE, same bug class as encode_video()
         above. Upstream already batches the actual VAE decode call by
         decode_chunk_size (the for loop below, unchanged), but then
-        concatenates every batch into one whole-chunk tensor BEFORE casting
-        to float32 - upstream's own comment calls that cast "not
-        significant overhead", true only at the small decode_chunk_size-ish
-        frame counts video generation normally uses, not at our CHUNK_SIZE
-        (which can be 1000+ frames chained into one call). Fixed by casting
-        each batch to float32 individually, before concatenation, so the
-        cast's memory footprint is bounded by decode_chunk_size like every
-        other step here, not by the whole chunk.
+        concatenates every batch into one whole-chunk VRAM-resident tensor -
+        fine at the small decode_chunk_size-ish frame counts video
+        generation normally uses, but at CHUNK_SIZE=1800+ this concat alone
+        was measured OOM'ing on its own (a real crash this session, not
+        theoretical - ~6.9GiB for one call). The caller (__call__, below)
+        already consumes this output batch-by-batch anyway (see its own
+        postprocess_video loop), so there's no need to hold a combined
+        tensor on GPU at all: return a LIST of already-decoded,
+        already-reshaped batches instead of concatenating them here. The
+        caller's own final combine happens via postprocess_video's
+        np.concatenate/torch.cat, which runs on CPU/numpy (system RAM is
+        vastly more abundant here than VRAM) rather than GPU.
         """
         latents = latents.flatten(0, 1)
         latents = 1 / self.vae.config.scaling_factor * latents
@@ -99,18 +103,21 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         forward_vae_fn = self.vae._orig_mod.forward if is_compiled_module(self.vae) else self.vae.forward
         accepts_num_frames = "num_frames" in set(inspect.signature(forward_vae_fn).parameters.keys())
 
-        frames = []
+        frame_batches = []
         for i in range(0, latents.shape[0], decode_chunk_size):
             num_frames_in = latents[i : i + decode_chunk_size].shape[0]
             decode_kwargs = {}
             if accepts_num_frames:
                 decode_kwargs["num_frames"] = num_frames_in
             frame = self.vae.decode(latents[i : i + decode_chunk_size], **decode_kwargs).sample
-            frames.append(frame.float())  # cast per-batch, not after concatenation
-        frames = torch.cat(frames, dim=0)
-
-        frames = frames.reshape(-1, num_frames, *frames.shape[1:]).permute(0, 2, 1, 3, 4)
-        return frames
+            frame = frame.float()
+            # reshape/permute per-batch (using this batch's own frame count)
+            # instead of on one concatenated whole-chunk tensor - same
+            # [batch*frames, c, h, w] -> [batch, c, frames, h, w] transform
+            # upstream did, just applied per-batch.
+            frame = frame.reshape(-1, num_frames_in, *frame.shape[1:]).permute(0, 2, 1, 3, 4)
+            frame_batches.append(frame)
+        return frame_batches
 
     @staticmethod
     def check_inputs(video, height, width):
@@ -470,7 +477,12 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # latents_all may be longer than `num_frames` (this call's own new
             # frames) when it was seeded via `carry_latents` - use its actual
             # length rather than the input video's frame count.
-            frames = self.decode_latents(latents_all, latents_all.shape[1], decode_chunk_size)
+            # decode_latents now returns a LIST of already-decoded batches
+            # (see its own docstring) instead of one concatenated
+            # VRAM-resident tensor - a real OOM at CHUNK_SIZE=1800+ was
+            # measured on that concat alone this session. Consume the list
+            # directly here instead of re-slicing a combined tensor.
+            frame_batches = self.decode_latents(latents_all, latents_all.shape[1], decode_chunk_size)
 
             if track_time:
                 decode_event.record()
@@ -483,25 +495,26 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # VaeImageProcessor.postprocess() it calls internally) has no
             # batching of its own - it does an unbatched torch.stack() over
             # every frame in `frames` at once. Fine at normal video-gen
-            # frame counts, OOMs at our CHUNK_SIZE. Batch it ourselves by
-            # decode_chunk_size here (frames is [batch=1, channels,
-            # num_frames, H, W] - slice along the frame dim, dim=2) and
-            # reassemble, matching postprocess_video's own per-output_type
-            # return shape (np/pt add a leading batch dim via stack; pil
-            # returns a plain list-of-lists, one inner list per batch item).
+            # frame counts, OOMs at our CHUNK_SIZE. Each element of
+            # frame_batches is already decode_chunk_size-sized (or smaller
+            # for the last one), so just postprocess each one directly - no
+            # slicing needed since decode_latents no longer returns one
+            # combined tensor. The FINAL combine (np.concatenate/torch.cat
+            # below) is the one unavoidable whole-chunk-sized allocation,
+            # but it happens on CPU/numpy (system RAM) rather than VRAM.
             if output_type == "pil":
                 postprocessed = []
-                for i in range(0, frames.shape[2], decode_chunk_size):
+                for batch in frame_batches:
                     batch_output = self.video_processor.postprocess_video(
-                        video=frames[:, :, i : i + decode_chunk_size], output_type=output_type
+                        video=batch, output_type=output_type
                     )
                     postprocessed.extend(batch_output[0])
                 frames = [postprocessed]
             else:
                 postprocessed = []
-                for i in range(0, frames.shape[2], decode_chunk_size):
+                for batch in frame_batches:
                     batch_output = self.video_processor.postprocess_video(
-                        video=frames[:, :, i : i + decode_chunk_size], output_type=output_type
+                        video=batch, output_type=output_type
                     )
                     postprocessed.append(batch_output)
                 if output_type == "np":
